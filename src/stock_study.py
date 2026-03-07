@@ -21,50 +21,48 @@ def setup_directories():
         
     is_kaggle = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is not None
     
-    # スクリプトの場所からプロジェクトルートを取得
+    # プロジェクトルートの特定 (srcの親ディレクトリ)
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(current_dir)
+    project_root = os.path.abspath(os.path.join(current_dir, ".."))
     
     if is_colab:
-        # ColabでのDriveパス判定 (My Drive または MyDrive)
         drive_mount_point = "/content/drive"
         
-        # パスの候補（スペースの有無）
-        possible_paths = [
-            os.path.join(drive_mount_point, "My Drive", "stock_data_hub"),
-            os.path.join(drive_mount_point, "MyDrive", "stock_data_hub")
+        # 複数の候補を検索
+        possible_drive_roots = [
+            os.path.join(drive_mount_point, "My Drive"),
+            os.path.join(drive_mount_point, "MyDrive"),
+            "/gdrive/My Drive"
         ]
         
-        drive_path = possible_paths[0] # デフォルト
-        found_drive = False
-        for p in possible_paths:
-            if os.path.exists(os.path.dirname(p)): # My Drive または MyDrive フォルダが存在するか
-                drive_path = p
-                found_drive = True
+        drive_path = None
+        for root in possible_drive_roots:
+            if os.path.exists(root):
+                drive_path = os.path.join(root, "stock_data_hub")
                 break
         
-        # マウント済みか実在チェックで判定
-        if not found_drive:
+        if drive_path is None:
+            # マウントされていないかパスが特殊な場合
             print("\n" + "!"*50)
-            print("WARNING: Google Drive may NOT be mounted or path is unexpected.")
-            print("Please run the following in a Colab cell first:")
-            print("from google.colab import drive; drive.mount('/content/drive')")
+            print("WARNING: Google Drive is NOT detected at standard paths.")
+            print("Defaulting to local VM storage (NOT persistent).")
+            print("Please run: from google.colab import drive; drive.mount('/content/drive')")
             print("!"*50 + "\n")
+            drive_path = "/content/stock_data_hub_local"
                 
         work_path = "/content/stock_data_work"
-        print(f"Environment: Colab. Drive Path: {drive_path}")
+        print(f"Environment: Colab. Project Root: {project_root}")
+        print(f"Drive Path: {drive_path}")
     elif is_kaggle:
-        # Kaggleでは通常 /kaggle/working 以下を使用
         drive_path = "/kaggle/working/stock_data_hub" 
         work_path = "/kaggle/working/stock_data_work"
-        print(f"Environment: Kaggle. Drive (Local): {drive_path}")
-        print("Note: To sync with Google Drive on Kaggle, use 'Add Data' or Kaggle API.")
+        print(f"Environment: Kaggle. Work: {work_path}")
     else:
-        # ローカル環境
         drive_path = os.path.join(project_root, "data_drive")
         work_path = os.path.join(project_root, "data_work")
-        print(f"Environment: Local. Project Root: {project_root}")
-        print(f"Drive (Simulated): {drive_path}")
+        print(f"Environment: Local.")
+        print(f"Project Root: {project_root}")
+        print(f"Drive Path: {drive_path}")
 
     os.makedirs(drive_path, exist_ok=True)
     os.makedirs(work_path, exist_ok=True)
@@ -85,7 +83,13 @@ def load_price_db(interval):
     if os.path.exists(drive_file):
         print(f"Loading {interval} DB from Drive...")
         shutil.copy2(drive_file, work_file)
-        return pd.read_parquet(work_file)
+        df = pd.read_parquet(work_file)
+        # 強制的にタイムゾーンを消去 (TypeError対策を強化)
+        if not df.empty and "date" in df.columns:
+            db_date_type = str(df["date"].dtype)
+            df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+            print(f"Loaded {interval} DB. Original date type: {db_date_type}, New: {df['date'].dtype}")
+        return df
     
     print(f"No existing DB found for {interval}. Creating new.")
     return pd.DataFrame(columns=["date", "ticker", "open", "high", "low", "close", "volume"])
@@ -155,7 +159,16 @@ def check_stock_splits(ticker, existing_ticker_df):
     # 保存範囲内で分割が発生しているか
     # タイムゾーンを消して比較 (TypeError回避)
     splits_no_tz = splits.index.tz_localize(None)
-    split_in_range = splits[(splits_no_tz >= first_saved_date) & (splits_no_tz <= last_saved_date)]
+    
+    # 型不整合のデバッグ出力を追加 (問題発生時のみ)
+    try:
+        split_in_range = splits[(splits_no_tz >= first_saved_date) & (splits_no_tz <= last_saved_date)]
+    except TypeError as e:
+        print(f"DEBUG - Comparison Error for {ticker}:")
+        print(f"  splits.index: {splits.index.dtype}")
+        print(f"  splits_no_tz: {splits_no_tz.dtype}")
+        print(f"  first_saved_date: {type(first_saved_date)} / {first_saved_date}")
+        raise e
     if not split_in_range.empty:
         return True
         
@@ -260,6 +273,8 @@ def update_price_database():
 def main():
     start_time = datetime.now()
     print(f"Pipeline started at {start_time}")
+    print(f"Current Working Directory: {os.getcwd()}")
+    print(f"Script Location: {os.path.abspath(__file__)}")
     
     update_price_database()
     
