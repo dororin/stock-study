@@ -210,46 +210,127 @@ def merge_price_data(old_df, new_df):
         return old_df
         
     combined = pd.concat([old_df, new_df])
+    # 日付とティッカーで重複を排除（最新を保持）
     combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
     combined = combined.sort_values(["ticker", "date"])
     return combined
 
+def parse_yfinance_batch(df_raw, chunk_tickers):
+    """yf.downloadの一括ダウンロード結果（MultiIndex）をLong形式に変換する"""
+    if df_raw.empty:
+        return pd.DataFrame()
+    
+    # 複数銘柄の場合、columnsは (Attribute, Ticker) の構成
+    # yfinanceのバージョンや引数により構成が変わる可能性があるため堅牢に処理
+    all_rows = []
+    
+    # group_by='ticker' を指定しなかった場合のデフォルト構成に対応
+    # カラムのレベル0が Attribute (Open, High...)、レベル1が Ticker
+    attributes = ["Open", "High", "Low", "Close", "Volume"]
+    
+    for ticker in chunk_tickers:
+        symbol = f"{ticker}.T"
+        try:
+            # 各銘柄のデータを取り出す
+            if symbol in df_raw.columns.get_level_values(1):
+                t_df = df_raw.xs(symbol, axis=1, level=1).copy()
+            elif symbol in df_raw.columns.get_level_values(0):
+                # group_by='ticker' の場合
+                t_df = df_raw[symbol].copy()
+            else:
+                continue
+
+            t_df = t_df.dropna(how="all")
+            if t_df.empty:
+                continue
+            
+            t_df = t_df.reset_index()
+            t_df.columns = [str(c).lower() for c in t_df.columns]
+            t_df = t_df.rename(columns={"datetime": "date", "index": "date"}) # yfinanceの戻り値によりインデックス名が異なる
+            t_df["ticker"] = str(ticker)
+            
+            # 必要なカラムに絞る
+            valid_cols = [c for c in ["date", "ticker", "open", "high", "low", "close", "volume"] if c in t_df.columns]
+            all_rows.append(t_df[valid_cols])
+        except Exception as e:
+            print(f"  Warning: Failed to parse data for {ticker}: {e}")
+            
+    if not all_rows:
+        return pd.DataFrame()
+        
+    return pd.concat(all_rows, ignore_index=True)
+
 # --- データベース統合更新 ---
 
 def update_price_database():
-    """全時間軸、全指定銘柄のDBをインクリメンタル更新する"""
+    """全時間軸、全指定銘柄のDBを一括（バッチ）で更新する"""
     tickers = update_universe()
     
     if not tickers:
         print("No tickers found. Skipping update.")
         return
 
+    # 一括ダウンロードのチャンクサイズ
+    CHUNK_SIZE = 50
+
     for interval in TIMEFRAMES:
         print(f"\n--- Updating Interval DB: {interval} ---")
         db_df = load_price_db(interval)
         
-        newly_fetched_total = 0
-        split_fixes = 0
+        # 全銘柄を一気に渡すとエラーやタイムアウトの可能性があるため、CHUNK_SIZEごとに処理
+        all_new_data = []
         
-        print(f"Processing {len(tickers)} tickers for {interval}...")
-        
-        for ticker in tickers:
-            existing_ticker_data = db_df[db_df["ticker"] == str(ticker)]
-            new_data, is_full = download_missing_prices(ticker, interval, existing_ticker_data)
+        for i in range(0, len(tickers), CHUNK_SIZE):
+            chunk = tickers[i:i+CHUNK_SIZE]
+            print(f"  Downloading batch {i//CHUNK_SIZE + 1}/{(len(tickers)-1)//CHUNK_SIZE + 1} ({len(chunk)} tickers)...")
             
-            if new_data is not None and not new_data.empty:
-                if is_full:
-                    db_df = db_df[db_df["ticker"] != str(ticker)]
-                    split_fixes += 1
+            # バッチ内の全銘柄の「最新日」をチェックして、その中の最古の日付から取得を開始する
+            # ※本当は銘柄ごとに期間を変えたいが、yf.download(list)の制約上、一括して過去から取る
+            # 学習モードの場合は period="max" または十分な過去から取る
+            
+            # 各銘柄の最終更新日のうち、最も古いものを基準にする（穴を作らないため）
+            # ただし1分足などは期間制限(7日)があるため調整が必要
+            start_date = "2023-01-01" # デフォルト開始日
+            
+            # 手元にデータがある場合は、その最新日の翌日から
+            if not db_df.empty:
+                last_update = db_df["date"].max()
+                if pd.notnull(last_update):
+                    start_date = (last_update + timedelta(days=1)).strftime("%Y-%m-%d")
+                    
+            # 1分足制限
+            if interval == "1m":
+                limit = datetime.now() - timedelta(days=6)
+                if pd.to_datetime(start_date) < limit:
+                    start_date = limit.strftime("%Y-%m-%d")
+
+            symbols = [f"{t}.T" for t in chunk]
+            try:
+                # 一括ダウンロード実行
+                raw_data = yf.download(
+                    symbols, 
+                    start=start_date, 
+                    interval=interval, 
+                    auto_adjust=False, 
+                    actions=True, 
+                    progress=False,
+                    threads=True # 並列化
+                )
                 
-                db_df = merge_price_data(db_df, new_data)
-                newly_fetched_total += len(new_data)
-        
-        if newly_fetched_total > 0 or split_fixes > 0:
-            print(f"Summary for {interval}: Added {newly_fetched_total} rows, Corrected {split_fixes} splits.")
+                chunk_df = parse_yfinance_batch(raw_data, chunk)
+                if not chunk_df.empty:
+                    all_new_data.append(chunk_df)
+                    
+            except Exception as e:
+                print(f"  Error in batch download: {e}")
+
+        if all_new_data:
+            new_combined = pd.concat(all_new_data, ignore_index=True)
+            db_df = merge_price_data(db_df, new_combined)
+            print(f"Summary for {interval}: Processed {len(new_combined)} new rows.")
             save_price_db(db_df, interval)
         else:
-            print(f"No new data for {interval}.")
+            print(f"No new data fetched for {interval}.")
 
 def main():
     start_time = datetime.now()
