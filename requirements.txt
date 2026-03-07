@@ -1,0 +1,7 @@
+yfinance
+pandas
+pandas-datareader
+openpyxl
+pyarrow
+fastparquet
+requests

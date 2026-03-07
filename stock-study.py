@@ -1,301 +1,239 @@
+import os
 import pandas as pd
 import yfinance as yf
-import os
-from datetime import datetime
-import io
 import requests
+from datetime import datetime, timedelta
+import shutil
 
 # --- 設定 ---
 JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
-# Google Drive上の保存先パス (Colab環境を想定)
-# --- 環境設定 ---
-def get_environment():
-    """実行環境を判定する (colab, kaggle, local)"""
-    if os.environ.get('KAGGLE_KERNEL_RUN_TYPE'):
-        return 'kaggle'
-    try:
-        import google.colab
-        return 'colab'
-    except ImportError:
-        return 'local'
+TIMEFRAMES = ["1m", "5m", "60m", "1d"]
 
-def setup_storage():
-    """環境に応じたストレージ設定を行い、ベースディレクトリを返す"""
-    env = get_environment()
+# --- 環境判定とディレクトリ設定 ---
+def setup_directories():
+    """実行環境に応じて作業用(Local SSD)と保存用(Google Drive)のディレクトリを設定する"""
+    is_colab = False
+    try:
+        from google.colab import drive
+        is_colab = True
+    except ImportError:
+        pass
+        
+    is_kaggle = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is not None
     
-    if env == 'colab':
-        print("Detected environment: Google Colab")
+    if is_colab:
         from google.colab import drive
         drive.mount('/content/drive')
-        return "/content/drive/MyDrive/stock_data_hub"
-        
-    elif env == 'kaggle':
-        print("Detected environment: Kaggle")
-        # Kaggleの場合、GDriveから /kaggle/working (SSD) へコピーして使う想定
-        # ※認証や実際のコピー処理は、Kaggle Notebook側のセルで行うか、
-        # ここに実装を追加することも可能。
-        base_ssd = "/kaggle/working/stock_data_hub"
-        os.makedirs(base_ssd, exist_ok=True)
-        return base_ssd
-        
+        drive_path = "/content/drive/MyDrive/stock_data_hub"
+        work_path = "/content/stock_data_work"
+        print(f"Environment: Colab. Drive: {drive_path}")
+    elif is_kaggle:
+        # KaggleではDrive認証はユーザーが行う必要があるが、パスとしては以下を想定
+        drive_path = "/kaggle/working/drive/MyDrive/stock_data_hub" 
+        work_path = "/kaggle/working/stock_data_work"
+        print(f"Environment: Kaggle. Work: {work_path}")
     else:
-        print("Detected environment: Local")
-        return "./data"
+        drive_path = "./data_drive"
+        work_path = "./data_work"
+        print(f"Environment: Local. Drive (Simulated): {drive_path}")
 
-BASE_DIR = setup_storage()
-UNIVERSE_DIR = os.path.join(BASE_DIR, "universe")
-PRICE_DIR = os.path.join(BASE_DIR, "price")
-
-os.makedirs(UNIVERSE_DIR, exist_ok=True)
-os.makedirs(PRICE_DIR, exist_ok=True)
-
-# 取得する時間軸と最大期間の定義
-# 5mから15m, 30m、60mから90mをそれぞれリサンプリングで生成
-TIMEFRAMES = {
-    "1m": "max",
-    "5m": "max",
-    "60m": "max",
-    "1d": "max" 
-}
-
-RESAMPLE_MAP = {
-    # (元となる時間軸, 生成する時間軸, リサンプリングルール)
-    "5m": [("15m", "15T"), ("30m", "30T")],
-    "60m": [("90m", "90T")]
-}
-
-def download_jpx_list():
-    """JPXから銘柄一覧(Excel)をダウンロードしてDataFrameで返す"""
-    print(f"Downloading JPX list from {JPX_URL}...")
-    response = requests.get(JPX_URL)
-    response.raise_for_status()
-    # Excelファイルを読み込み
-    df = pd.read_excel(io.BytesIO(response.content))
-    return df
-
-def filter_by_market(df):
-    """市場区分でフィルタリング (プライム・スタンダードのみ)"""
-    # カラム名などは構造に合わせる必要がある (通常: '市場・商品区分')
-    target_markets = ["プライム（内国株式）", "スタンダード（内国株式）"]
-    df_filtered = df[df["市場・商品区分"].isin(target_markets)].copy()
-    return df_filtered
-
-def get_dynamic_metrics(tickers):
-    """yfinanceを使用して時価総額と売買代金を取得する"""
-    results = []
-    # 負荷軽減のためバッチ処理を検討すべきだが、まずは簡易実装
-    for ticker in tickers:
-        symbol = f"{ticker}.T"
-        try:
-            t = yf.Ticker(symbol)
-            info = t.info
-            # 直近の売買代金 (ボリューム * 価格) の簡易計算、または履歴から計算
-            # ここでは info の averageVolume * currentPrice で概算
-            market_cap = info.get("marketCap", 0)
-            price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-            avg_vol = info.get("averageVolume", 0)
-            liquidity = avg_vol * price
-            
-            results.append({
-                "Ticker": ticker,
-                "MarketCap": market_cap,
-                "Liquidity": liquidity
-            })
-        except Exception as e:
-            print(f"Error fetching {symbol}: {e}")
-            continue
-    return pd.DataFrame(results)
-
-def adjust_splits(df):
-    """
-    actions=Trueで取得したdfに対し、Stock Splitsを用いて過去に遡って価格を修正する。
-    配当落ち(Dividends)は無視する。
-    """
-    if 'Stock Splits' not in df.columns or df['Stock Splits'].sum() == 0:
-        return df
+    os.makedirs(drive_path, exist_ok=True)
+    os.makedirs(work_path, exist_ok=True)
     
-    # 分割比率の累積値を計算 (現在から過去へ)
-    splits = df['Stock Splits'].copy()
-    splits = splits.replace(0, 1)
-    
-    # 累積分割係数: 現在を1.0として、過去に遡るほど (1/分割数) を掛けていく
-    # cumulative_factor[i] = PRODUCT(1/splits[j] for j from i+1 to end)
-    cumulative_factor = (1 / splits).iloc[::-1].cumprod().iloc[::-1]
-    cumulative_factor = cumulative_factor.shift(-1).fillna(1.0)
-    
-    for col in ['Open', 'High', 'Low', 'Close']:
-        if col in df.columns:
-            df[col] = df[col] * cumulative_factor
-            
-    return df
+    return drive_path, work_path
 
-def download_price_data(ticker, interval, period, start=None):
-    """
-    指定した銘柄・時間軸のデータを取得して分割調整を行い、保存する。
-    startが指定されている場合は、その日付以降の差分のみを取得して追記する。
-    """
+DRIVE_DIR, WORK_DIR = setup_directories()
+UNIVERSE_PATH_DRIVE = os.path.join(DRIVE_DIR, "universe_latest.parquet")
+UNIVERSE_PATH_WORK = os.path.join(WORK_DIR, "universe_latest.parquet")
+
+# --- データベース操作 ---
+
+def load_price_db(interval):
+    """Google Driveの統合ファイルをローカル作業領域にコピーして読み込む"""
+    drive_file = os.path.join(DRIVE_DIR, f"price_{interval}.parquet")
+    work_file = os.path.join(WORK_DIR, f"price_{interval}.parquet")
+    
+    if os.path.exists(drive_file):
+        print(f"Loading {interval} DB from Drive...")
+        shutil.copy2(drive_file, work_file)
+        return pd.read_parquet(work_file)
+    
+    print(f"No existing DB found for {interval}. Creating new.")
+    return pd.DataFrame(columns=["date", "ticker", "open", "high", "low", "close", "volume"])
+
+def save_price_db(df, interval):
+    """ローカルの作業ファイルをGoogle Driveに上書き保存する"""
+    if df.empty: return
+    
+    work_file = os.path.join(WORK_DIR, f"price_{interval}.parquet")
+    drive_file = os.path.join(DRIVE_DIR, f"price_{interval}.parquet")
+    
+    df.to_parquet(work_file, index=False)
+    shutil.copy2(work_file, drive_file)
+    print(f"Saved updated price_{interval}.parquet to Drive. Row count: {len(df)}")
+
+# --- 銘柄ユニバース管理 ---
+
+def update_universe():
+    """JPXから最新リストを取得し、前回との差分（新規追加銘柄）を返す"""
+    print("Fetching latest JPX list...")
+    resp = requests.get(JPX_URL)
+    temp_xls = "temp_jpx.xls"
+    with open(temp_xls, "wb") as f:
+        f.write(resp.content)
+    df_raw = pd.read_excel(temp_xls)
+    os.remove(temp_xls)
+    
+    # プライム・スタンダード限定
+    df_new = df_raw[df_raw["市場・商品区分"].str.contains("プライム|スタンダード", na=False)].copy()
+    new_tickers = df_new["コード"].astype(str).tolist()
+    
+    old_tickers = []
+    if os.path.exists(UNIVERSE_PATH_DRIVE):
+        old_df = pd.read_parquet(UNIVERSE_PATH_DRIVE)
+        old_tickers = old_df["ticker"].astype(str).tolist()
+    
+    added = list(set(new_tickers) - set(old_tickers))
+    removed = list(set(old_tickers) - set(new_tickers))
+    
+    # 最新を保存
+    pd.DataFrame({"ticker": new_tickers}).to_parquet(UNIVERSE_PATH_DRIVE, index=False)
+    
+    print(f"Universe Sync: Total={len(new_tickers)}, Added={len(added)}, Removed={len(removed)}")
+    return new_tickers, added
+
+# --- 株価取得・加工 ---
+
+def check_stock_splits(ticker, existing_ticker_df):
+    """保存済み期間内に分割があるか、actionsデータで確認する"""
+    if existing_ticker_df.empty:
+        return True # 新規銘柄はフル取得
+    
     symbol = f"{ticker}.T"
+    y_ticker = yf.Ticker(symbol)
+    actions = y_ticker.actions
+    
+    if actions.empty or "Stock Splits" not in actions.columns:
+        return False
+        
+    splits = actions[actions["Stock Splits"] != 0]
+    if splits.empty:
+        return False
+        
+    last_saved_date = pd.to_datetime(existing_ticker_df["date"]).max()
+    first_saved_date = pd.to_datetime(existing_ticker_df["date"]).min()
+    
+    # 保存範囲内で分割が発生しているか
+    split_in_range = splits[(splits.index >= first_saved_date) & (splits.index <= last_saved_date)]
+    if not split_in_range.empty:
+        return True
+        
+    return False
+
+def download_missing_prices(ticker, interval, existing_ticker_df):
+    """差分またはフル(分割時)でデータを取得する"""
+    symbol = f"{ticker}.T"
+    needs_full = check_stock_splits(ticker, existing_ticker_df)
+    
+    start_date = None
+    if not needs_full:
+        # 最新の日付の翌日から取得
+        last_date = pd.to_datetime(existing_ticker_df["date"]).max()
+        if pd.notnull(last_date):
+            start_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            # 1分足等の取得期間制限に注意
+            if interval == "1m":
+                limit = datetime.now() - timedelta(days=6)
+                if last_date < limit: start_date = limit.strftime("%Y-%m-%d")
+
     try:
-        if start:
-            # 差分更新
-            df_new = yf.download(symbol, start=start, interval=interval, auto_adjust=False, actions=True, progress=False)
+        if start_date:
+            df = yf.download(symbol, start=start_date, interval=interval, auto_adjust=False, actions=True, progress=False)
         else:
-            # 新規取得
-            df_new = yf.download(symbol, period=period, interval=interval, auto_adjust=False, actions=True, progress=False)
+            df = yf.download(symbol, period="max", interval=interval, auto_adjust=False, actions=True, progress=False)
             
-        if df_new.empty:
-            return None
+        if df.empty: return None, False
         
-        # MultiIndexの解消
-        if isinstance(df_new.columns, pd.MultiIndex):
-            df_new.columns = df_new.columns.get_level_values(0)
-        df_new.columns = [str(c).lower() for c in df_new.columns]
+        # 整形
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
         
-        save_path = os.path.join(PRICE_DIR, interval, f"{ticker}.parquet")
+        df = df.reset_index()
+        df.columns = [str(c).lower() for c in df.columns]
+        df = df.rename(columns={"datetime": "date"})
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        df["ticker"] = str(ticker)
         
-        # 既存データの読み込み (差分更新の場合)
-        if start and os.path.exists(save_path):
-            df_old = pd.read_parquet(save_path)
-            # 重複を排除して結合
-            df_combined = pd.concat([df_old, df_new]).sort_index()
-            df_combined = df_combined[~df_combined.index.duplicated(keep='last')]
-        else:
-            df_combined = df_new
-
-        # 分割調整 (ロバスト版)
-        # 差分に分割が含まれているか、または新規取得の場合は全体に適用
-        split_col = 'stock splits' if 'stock splits' in df_combined.columns else 'Stock Splits'
-        if split_col in df_combined.columns and df_combined[split_col].sum() > 0:
-            # 分割を検知した場合
-            if start:
-                print(f" !!! Split detected in increment for {ticker}. Forcing full re-calculation...")
-                return download_price_data(ticker, interval, period="max") # 再帰的にフル取得
-            
-            # フル調整ロジック
-            split_events = df_combined[df_combined[split_col] != 0].copy().sort_index()
-            adjustment_factor = pd.Series(1.0, index=df_combined.index)
-            
-            for date in split_events.index:
-                split_ratio = split_events.loc[date, split_col]
-                if isinstance(split_ratio, pd.Series): split_ratio = split_ratio.iloc[0]
-                if split_ratio <= 0 or split_ratio == 1.0: continue
-                
-                try:
-                    idx = df_combined.index.get_loc(date)
-                    if idx > 0:
-                        price_before = df_combined['close'].iloc[idx-1]
-                        price_after = df_combined['close'].iloc[idx]
-                        if price_after > 0:
-                            actual_ratio = price_before / price_after
-                            if abs(actual_ratio - split_ratio) < abs(actual_ratio - 1.0):
-                                adjustment_factor.iloc[:idx] *= (1 / split_ratio)
-                except:
-                    continue
-            
-            for col in ['open', 'high', 'low', 'close']:
-                if col in df_combined.columns:
-                    df_combined[col] = df_combined[col] * adjustment_factor
+        # 必要なカラムのみ
+        cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
+        df = df[[c for c in cols if c in df.columns]]
         
-        # 保存
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        df_combined.to_parquet(save_path)
-        return df_combined
+        return df, needs_full
     except Exception as e:
-        print(f"Error processing {symbol} ({interval}): {e}")
-        return None
+        print(f"Error downloading {ticker}: {e}")
+        return None, False
 
-def process_universe():
-    """ユニバースの更新と全銘柄の初期ダウンロード/更新を行う"""
-    # 1. JPXリスト取得
-    df_jpx = download_jpx_list()
-    
-    # 2. 市場区分フィルタ
-    df_universe = filter_by_market(df_jpx)
-    tickers = df_universe["コード"].astype(str).tolist()
-    
-    print(f"Total candidates after market filtering: {len(tickers)}")
-    
-    # 3. 動的監視 (時価総額・流動性)
-    print("Fetching metrics for all candidates (this may take time)...")
-    # 本番運用ではここで並列処理(ThreadPoolExecutor等)を推奨
-    metrics_df = get_dynamic_metrics(tickers)
-    
-    # フィルタ条件
-    train_mask = (metrics_df["MarketCap"] >= 1e10) & (metrics_df["MarketCap"] <= 1e12) & (metrics_df["Liquidity"] >= 1e8)
-    ops_mask = (metrics_df["MarketCap"] >= 3e10) & (metrics_df["MarketCap"] <= 5e11) & (metrics_df["Liquidity"] >= 5e8)
-    
-    train_list = metrics_df[train_mask]
-    ops_list = metrics_df[ops_mask]
-    
-    # ユニバース保存
-    timestamp = datetime.now().strftime("%Y%m%d")
-    train_list.to_parquet(f"{UNIVERSE_DIR}/universe_train_{timestamp}.parquet")
-    ops_list.to_parquet(f"{UNIVERSE_DIR}/universe_ops_{timestamp}.parquet")
-    
-    # 最新版へのシンボリックリンク的保存 (更新用)
-    train_list.to_parquet(f"{UNIVERSE_DIR}/universe_train_latest.parquet")
-    ops_list.to_parquet(f"{UNIVERSE_DIR}/universe_ops_latest.parquet")
-    
-    print(f"Universe updated. Training: {len(train_list)}, Operational: {len(ops_list)}")
-    return train_list, ops_list
+def merge_price_data(old_df, new_df):
+    """結合・重複削除・ソート"""
+    if new_df is None or new_df.empty:
+        return old_df
+        
+    combined = pd.concat([old_df, new_df])
+    combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
+    combined = combined.sort_values(["ticker", "date"])
+    return combined
 
-def update_all_prices(ticker_list):
-    """リストにある全銘柄の価格データを更新する"""
-    for ticker in ticker_list:
-        # 代表して '1d' の既存データから開始日を決定
-        check_path = os.path.join(PRICE_DIR, "1d", f"{ticker}.parquet")
-        start_date = None
-        if os.path.exists(check_path):
-            existing_df = pd.read_parquet(check_path)
-            start_date = (existing_df.index.max() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+# --- データベース統合更新 ---
+
+def update_price_database():
+    """全時間軸、全銘柄のDBをインクリメンタル更新する"""
+    tickers, added_tickers = update_universe()
+    
+    # 全銘柄を回る
+    for interval in TIMEFRAMES:
+        print(f"\n--- Updating Interval DB: {interval} ---")
+        db_df = load_price_db(interval)
         
-        print(f"Updating {ticker}...")
-        downloaded_dfs = {}
-        for interval, period in TIMEFRAMES.items():
-            df = download_price_data(ticker, interval, period, start=start_date)
-            if df is not None:
-                downloaded_dfs[interval] = df
+        # date型の整形
+        if not db_df.empty:
+            db_df["date"] = pd.to_datetime(db_df["date"]).dt.tz_localize(None)
         
-        # リサンプリング生成
-        for base_interval, targets in RESAMPLE_MAP.items():
-            if base_interval in downloaded_dfs:
-                base_df = downloaded_dfs[base_interval]
-                for target_interval, rule in targets:
-                    resampled = base_df.resample(rule).agg({
-                        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-                    }).dropna()
-                    save_path = os.path.join(PRICE_DIR, target_interval, f"{ticker}.parquet")
-                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    resampled.to_parquet(save_path)
+        newly_fetched_total = 0
+        split_fixes = 0
+        
+        # テスト・デモ用に最初の50銘柄のみに制限（本番は tickers を使用）
+        process_list = tickers[:50] 
+        print(f"Processing {len(process_list)} tickers...")
+        
+        results = []
+        for ticker in process_list:
+            existing_ticker_data = db_df[db_df["ticker"] == str(ticker)]
+            
+            new_data, is_full = download_missing_prices(ticker, interval, existing_ticker_data)
+            
+            if new_data is not None and not new_data.empty:
+                if is_full:
+                    # 分割修正のため、一旦その銘柄をDBから削除
+                    db_df = db_df[db_df["ticker"] != str(ticker)]
+                    split_fixes += 1
+                
+                db_df = merge_price_data(db_df, new_data)
+                newly_fetched_total += len(new_data)
+        
+        if newly_fetched_total > 0 or split_fixes > 0:
+            print(f"Summary for {interval}: Added {newly_fetched_total} rows, Corrected {split_fixes} splits.")
+            save_price_db(db_df, interval)
+        else:
+            print(f"No new data for {interval}.")
 
 def main():
-    # 本番運用の流れ: 
-    # 1. 銘柄ユニバースを更新 (月1回程度)
-    # train_list, ops_list = process_universe()
+    start_time = datetime.now()
+    print(f"Pipeline started at {start_time}")
     
-    # 2. 全銘柄の価格を更新 (毎日)
-    # tickers = pd.read_parquet(f"{UNIVERSE_DIR}/universe_train_latest.parquet")["Ticker"].tolist()
-    # update_all_prices(tickers)
+    update_price_database()
     
-    # --- デモ/検証用コード ---
-    print("--- Running Demo/Verification ---")
-    
-    # テスト対象を選択 (1301.T)
-    target_ticker = "1301"
-    
-    # 分割調整の検証 (トヨタ: 7203.T)
-    print("\nVerifying split adjustment for 7203.T...")
-    download_price_data("7203", "1d", "5y")
-    final_toyota = pd.read_parquet(os.path.join(PRICE_DIR, "1d", "7203.parquet"))
-    final_toyota.index = pd.to_datetime(final_toyota.index).date
-    d_b, d_a = datetime(2021, 9, 28).date(), datetime(2021, 9, 29).date()
-    if d_b in final_toyota.index and d_a in final_toyota.index:
-        p_b, p_a = final_toyota.loc[d_b, "close"], final_toyota.loc[d_a, "close"]
-        if hasattr(p_b, "__iter__"): p_b = p_b.iloc[0]
-        if hasattr(p_a, "__iter__"): p_a = p_a.iloc[0]
-        print(f" - Ratio 2021-09-28/29: {p_a/p_b:.4f} (Target: ~1.0)")
-
-    print(f"\nPipeline demonstration complete. Results in {BASE_DIR}")
+    end_time = datetime.now()
+    print(f"\nPipeline finished. Duration: {end_time - start_time}")
 
 if __name__ == "__main__":
     main()
