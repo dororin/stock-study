@@ -9,6 +9,17 @@ import shutil
 JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 TIMEFRAMES = ["1m", "5m", "60m", "1d"]
 
+# --- ユニバース条件 ---
+# 学習用
+L_MIN_CAP = 100 * 10**8      # 100億円
+L_MAX_CAP = 1 * 10**12       # 1兆円
+L_MIN_TURNOVER = 1 * 10**8   # 1億円
+
+# 運用用
+O_MIN_CAP = 300 * 10**8      # 300億円
+O_MAX_CAP = 5000 * 10**8     # 5000億円
+O_MIN_TURNOVER = 5 * 10**8   # 5億円
+
 # --- 環境判定とディレクトリ設定 ---
 def setup_directories():
     """実行環境に応じて作業用(Local SSD)と保存用(Google Drive)のディレクトリを設定する"""
@@ -70,8 +81,8 @@ def setup_directories():
     return drive_path, work_path
 
 DRIVE_DIR, WORK_DIR = setup_directories()
-UNIVERSE_PATH_DRIVE = os.path.join(DRIVE_DIR, "universe_latest.parquet")
-UNIVERSE_PATH_WORK = os.path.join(WORK_DIR, "universe_latest.parquet")
+UN_L_DRIVE = os.path.join(DRIVE_DIR, "universe_learning.parquet")
+UN_O_DRIVE = os.path.join(DRIVE_DIR, "universe_operational.parquet")
 
 # --- データベース操作 ---
 
@@ -108,7 +119,7 @@ def save_price_db(df, interval):
 # --- 銘柄ユニバース管理 ---
 
 def update_universe():
-    """JPXから最新リストを取得し、前回との差分（新規追加銘柄）を返す"""
+    """JPXから取得した全銘柄を時価総額と流動性でフィルタリングし、学習用と運用用のリストを保存する"""
     print("Fetching latest JPX list...")
     resp = requests.get(JPX_URL)
     temp_xls = "temp_jpx.xls"
@@ -117,23 +128,84 @@ def update_universe():
     df_raw = pd.read_excel(temp_xls)
     os.remove(temp_xls)
     
-    # プライム・スタンダード限定
-    df_new = df_raw[df_raw["市場・商品区分"].str.contains("プライム|スタンダード", na=False)].copy()
-    new_tickers = df_new["コード"].astype(str).tolist()
+    # 東証プライム・スタンダード限定
+    df_base = df_raw[df_raw["市場・商品区分"].str.contains("プライム|スタンダード", na=False)].copy()
+    all_tickers = df_base["コード"].astype(str).tolist()
+    print(f"Base Universe (Prime/Standard): {len(all_tickers)} tickers")
+
+    # 1. 売買代金（流動性）の取得とフィルタリング
+    # yf.downloadで一括取得（1ヶ月分の1dデータ）
+    print("Downloading 1-month daily data for turnover analysis...")
+    symbols = [f"{t}.T" for t in all_tickers]
     
-    old_tickers = []
-    if os.path.exists(UNIVERSE_PATH_DRIVE):
-        old_df = pd.read_parquet(UNIVERSE_PATH_DRIVE)
-        old_tickers = old_df["ticker"].astype(str).tolist()
+    # チャンク分けして取得（APIエラー回避）
+    chunk_size = 200
+    all_turnovers = []
     
-    added = list(set(new_tickers) - set(old_tickers))
-    removed = list(set(old_tickers) - set(new_tickers))
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i+chunk_size]
+        print(f"  Downloading turnover data: chunk {i//chunk_size + 1}/{len(symbols)//chunk_size + 1}...")
+        data = yf.download(chunk, period="1mo", interval="1d", progress=False, group_by='ticker')
+        
+        for sym in chunk:
+            if sym in data.columns.get_level_values(0):
+                ticker_data = data[sym].dropna()
+                if not ticker_data.empty and "Close" in ticker_data.columns and "Volume" in ticker_data.columns:
+                    # 売買代金 = 終値 * 出来高
+                    turnover = (ticker_data["Close"] * ticker_data["Volume"]).mean()
+                    ticker_code = sym.replace(".T", "")
+                    all_turnovers.append({"ticker": ticker_code, "turnover": turnover})
     
-    # 最新を保存
-    pd.DataFrame({"ticker": new_tickers}).to_parquet(UNIVERSE_PATH_DRIVE, index=False)
+    if not all_turnovers:
+        print("Failed to fetch any turnover data.")
+        return []
+        
+    df_prices = pd.DataFrame(all_turnovers)
     
-    print(f"Universe Sync: Total={len(new_tickers)}, Added={len(added)}, Removed={len(removed)}")
-    return new_tickers, added
+    # 流動性フィルタ（学習用と運用用の低い方を基準に残す）
+    min_needed_turnover = min(L_MIN_TURNOVER, O_MIN_TURNOVER)
+    df_filtered = df_prices[df_prices["turnover"] >= min_needed_turnover].copy()
+    print(f"Tickers passing liquidity filter: {len(df_filtered)}")
+
+    # 2. 時価総額の取得と最終フィルタ
+    print("Fetching market capitalization for candidate tickers...")
+    symbols_to_check = [f"{t}.T" for t in df_filtered["ticker"].tolist()]
+    
+    learning_list = []
+    operational_list = []
+    
+    # yf.Tickersを使ってfast_infoを一括取得
+    for i in range(0, len(symbols_to_check), chunk_size):
+        chunk = symbols_to_check[i:i+chunk_size]
+        print(f"  Fetching market cap: chunk {i//chunk_size + 1}/{len(symbols_to_check)//chunk_size + 1}...")
+        tickers_obj = yf.Tickers(" ".join(chunk))
+        for sym in chunk:
+            try:
+                mkt_cap = tickers_obj.tickers[sym].fast_info['marketCap']
+                if mkt_cap is None: continue
+                
+                ticker_base = sym.replace(".T", "")
+                turnover = df_filtered[df_filtered["ticker"] == ticker_base]["turnover"].values[0]
+                
+                # 学習用
+                if L_MIN_CAP <= mkt_cap <= L_MAX_CAP and turnover >= L_MIN_TURNOVER:
+                    learning_list.append(ticker_base)
+                
+                # 運用用
+                if O_MIN_CAP <= mkt_cap <= O_MAX_CAP and turnover >= O_MIN_TURNOVER:
+                    operational_list.append(ticker_base)
+            except:
+                continue
+
+    # 保存
+    pd.DataFrame({"ticker": learning_list}).to_parquet(UN_L_DRIVE, index=False)
+    pd.DataFrame({"ticker": operational_list}).to_parquet(UN_O_DRIVE, index=False)
+    
+    print(f"Final Universe Counts: Learning={len(learning_list)}, Operational={len(operational_list)}")
+    
+    # 統合したリスト（データ取得対象）を返す
+    update_targets = list(set(learning_list) | set(operational_list))
+    return update_targets
 
 # --- 株価取得・加工 ---
 
@@ -231,8 +303,12 @@ def merge_price_data(old_df, new_df):
 
 def update_price_database():
     """全時間軸、全銘柄のDBをインクリメンタル更新する"""
-    tickers, added_tickers = update_universe()
+    tickers = update_universe()
     
+    if not tickers:
+        print("No tickers in universe. Skipping update.")
+        return
+
     # 全銘柄を回る
     for interval in TIMEFRAMES:
         print(f"\n--- Updating Interval DB: {interval} ---")
@@ -245,12 +321,9 @@ def update_price_database():
         newly_fetched_total = 0
         split_fixes = 0
         
-        # テスト・デモ用に最初の50銘柄のみに制限（本番は tickers を使用）
-        process_list = tickers[:50] 
-        print(f"Processing {len(process_list)} tickers...")
+        print(f"Processing {len(tickers)} tickers for {interval}...")
         
-        results = []
-        for ticker in process_list:
+        for ticker in tickers:
             existing_ticker_data = db_df[db_df["ticker"] == str(ticker)]
             
             new_data, is_full = download_missing_prices(ticker, interval, existing_ticker_data)
