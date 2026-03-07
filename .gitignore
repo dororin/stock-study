@@ -10,6 +10,8 @@ data/
 *.xls
 *.xlsx
 *.parquet
+*.csv
+*.pkl
 
 # IDE
 .vscode/

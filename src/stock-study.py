@@ -21,6 +21,10 @@ def setup_directories():
         
     is_kaggle = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is not None
     
+    # スクリプトの場所からプロジェクトルートを取得
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
+    
     if is_colab:
         from google.colab import drive
         drive.mount('/content/drive')
@@ -33,9 +37,10 @@ def setup_directories():
         work_path = "/kaggle/working/stock_data_work"
         print(f"Environment: Kaggle. Work: {work_path}")
     else:
-        drive_path = "./data_drive"
-        work_path = "./data_work"
-        print(f"Environment: Local. Drive (Simulated): {drive_path}")
+        drive_path = os.path.join(project_root, "data_drive")
+        work_path = os.path.join(project_root, "data_work")
+        print(f"Environment: Local. Project Root: {project_root}")
+        print(f"Drive (Simulated): {drive_path}")
 
     os.makedirs(drive_path, exist_ok=True)
     os.makedirs(work_path, exist_ok=True)
