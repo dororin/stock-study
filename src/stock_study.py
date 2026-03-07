@@ -26,11 +26,18 @@ def setup_directories():
     project_root = os.path.dirname(current_dir)
     
     if is_colab:
-        from google.colab import drive
-        drive.mount('/content/drive')
         drive_path = "/content/drive/MyDrive/stock_data_hub"
+        # マウント済みかチェック
+        if not os.path.exists("/content/drive/MyDrive"):
+            # My Driveの場合もあるので予備チェック
+            if os.path.exists("/content/drive/My Drive"):
+                drive_path = "/content/drive/My Drive/stock_data_hub"
+            else:
+                print("Error: Google Drive is not mounted. Please mount it in the Colab cell first.")
+        
         work_path = "/content/stock_data_work"
-        print(f"Environment: Colab. Drive: {drive_path}")
+        print(f"Environment: Colab. Project Root: {project_root}")
+        print(f"Drive Path: {drive_path}")
     elif is_kaggle:
         drive_path = "/kaggle/working/drive/MyDrive/stock_data_hub" 
         work_path = "/kaggle/working/stock_data_work"
