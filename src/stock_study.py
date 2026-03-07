@@ -29,14 +29,6 @@ def setup_directories():
         # ColabでのDriveパス判定 (My Drive または MyDrive)
         drive_mount_point = "/content/drive"
         
-        # マウント済みかチェック
-        if not os.path.ismount(drive_mount_point):
-            print("\n" + "!"*50)
-            print("WARNING: Google Drive is NOT mounted.")
-            print("Please run the following in a Colab cell first:")
-            print("from google.colab import drive; drive.mount('/content/drive')")
-            print("!"*50 + "\n")
-            
         # パスの候補（スペースの有無）
         possible_paths = [
             os.path.join(drive_mount_point, "My Drive", "stock_data_hub"),
@@ -44,10 +36,20 @@ def setup_directories():
         ]
         
         drive_path = possible_paths[0] # デフォルト
+        found_drive = False
         for p in possible_paths:
             if os.path.exists(os.path.dirname(p)): # My Drive または MyDrive フォルダが存在するか
                 drive_path = p
+                found_drive = True
                 break
+        
+        # マウント済みか実在チェックで判定
+        if not found_drive:
+            print("\n" + "!"*50)
+            print("WARNING: Google Drive may NOT be mounted or path is unexpected.")
+            print("Please run the following in a Colab cell first:")
+            print("from google.colab import drive; drive.mount('/content/drive')")
+            print("!"*50 + "\n")
                 
         work_path = "/content/stock_data_work"
         print(f"Environment: Colab. Drive Path: {drive_path}")
@@ -151,7 +153,9 @@ def check_stock_splits(ticker, existing_ticker_df):
     first_saved_date = pd.to_datetime(existing_ticker_df["date"]).min()
     
     # 保存範囲内で分割が発生しているか
-    split_in_range = splits[(splits.index >= first_saved_date) & (splits.index <= last_saved_date)]
+    # タイムゾーンを消して比較 (TypeError回避)
+    splits_no_tz = splits.index.tz_localize(None)
+    split_in_range = splits[(splits_no_tz >= first_saved_date) & (splits_no_tz <= last_saved_date)]
     if not split_in_range.empty:
         return True
         
