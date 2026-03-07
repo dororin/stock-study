@@ -26,17 +26,39 @@ def setup_directories():
     project_root = os.path.dirname(current_dir)
     
     if is_colab:
-        from google.colab import drive
-        drive.mount('/content/drive')
-        drive_path = "/content/drive/MyDrive/stock_data_hub"
+        # ColabでのDriveパス判定 (My Drive または MyDrive)
+        drive_mount_point = "/content/drive"
+        
+        # マウント済みかチェック
+        if not os.path.ismount(drive_mount_point):
+            print("\n" + "!"*50)
+            print("WARNING: Google Drive is NOT mounted.")
+            print("Please run the following in a Colab cell first:")
+            print("from google.colab import drive; drive.mount('/content/drive')")
+            print("!"*50 + "\n")
+            
+        # パスの候補（スペースの有無）
+        possible_paths = [
+            os.path.join(drive_mount_point, "My Drive", "stock_data_hub"),
+            os.path.join(drive_mount_point, "MyDrive", "stock_data_hub")
+        ]
+        
+        drive_path = possible_paths[0] # デフォルト
+        for p in possible_paths:
+            if os.path.exists(os.path.dirname(p)): # My Drive または MyDrive フォルダが存在するか
+                drive_path = p
+                break
+                
         work_path = "/content/stock_data_work"
-        print(f"Environment: Colab. Drive: {drive_path}")
+        print(f"Environment: Colab. Drive Path: {drive_path}")
     elif is_kaggle:
-        # KaggleではDrive認証はユーザーが行う必要があるが、パスとしては以下を想定
-        drive_path = "/kaggle/working/drive/MyDrive/stock_data_hub" 
+        # Kaggleでは通常 /kaggle/working 以下を使用
+        drive_path = "/kaggle/working/stock_data_hub" 
         work_path = "/kaggle/working/stock_data_work"
-        print(f"Environment: Kaggle. Work: {work_path}")
+        print(f"Environment: Kaggle. Drive (Local): {drive_path}")
+        print("Note: To sync with Google Drive on Kaggle, use 'Add Data' or Kaggle API.")
     else:
+        # ローカル環境
         drive_path = os.path.join(project_root, "data_drive")
         work_path = os.path.join(project_root, "data_work")
         print(f"Environment: Local. Project Root: {project_root}")
