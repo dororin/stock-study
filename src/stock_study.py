@@ -303,6 +303,16 @@ def update_price_database():
                 limit = datetime.now() - timedelta(days=6)
                 if pd.to_datetime(start_date) < limit:
                     start_date = limit.strftime("%Y-%m-%d")
+            # 5分足制限 (60日)
+            elif interval == "5m":
+                limit = datetime.now() - timedelta(days=59)
+                if pd.to_datetime(start_date) < limit:
+                    start_date = limit.strftime("%Y-%m-%d")
+            # 60分足制限 (730日)
+            elif interval == "60m":
+                limit = datetime.now() - timedelta(days=729)
+                if pd.to_datetime(start_date) < limit:
+                    start_date = limit.strftime("%Y-%m-%d")
 
             symbols = [f"{t}.T" for t in chunk]
             try:
@@ -325,10 +335,15 @@ def update_price_database():
                 print(f"  Error in batch download: {e}")
 
         if all_new_data:
-            new_combined = pd.concat(all_new_data, ignore_index=True)
-            db_df = merge_price_data(db_df, new_combined)
-            print(f"Summary for {interval}: Processed {len(new_combined)} new rows.")
-            save_price_db(db_df, interval)
+            # 空のDFを除外してconcat
+            all_new_data = [df for df in all_new_data if not df.empty]
+            if all_new_data:
+                new_combined = pd.concat(all_new_data, ignore_index=True)
+                db_df = merge_price_data(db_df, new_combined)
+                print(f"Summary for {interval}: Processed {len(new_combined)} new rows.")
+                save_price_db(db_df, interval)
+            else:
+                print(f"No valid data parsed for {interval}.")
         else:
             print(f"No new data fetched for {interval}.")
 
