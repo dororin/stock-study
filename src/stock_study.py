@@ -4,6 +4,7 @@ import yfinance as yf
 import requests
 from datetime import datetime, timedelta
 import shutil
+import time
 
 # --- 設定 ---
 JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
@@ -87,10 +88,10 @@ def save_price_db(df, interval):
 
 # --- 銘柄ユニバース管理 ---
 
-def update_universe():
+def update_universe(csv_filename="学習.csv"):
     """
     1. JPXから最新リストを単に保存（バックアップ）
-    2. Google Drive上の『学習.csv』から銘柄コードを取得
+    2. Google Drive上の指定のCSV（デフォルトは学習.csv）から銘柄コードを取得
     """
     # 1. JPXリストのバックアップ保存
     print("Backing up latest JPX list...")
@@ -103,8 +104,8 @@ def update_universe():
     except Exception as e:
         print(f"  Warning: Failed to backup JPX list: {e}")
 
-    # 2. 学習.csv の読み込み
-    csv_path = os.path.join(DRIVE_DIR, "学習.csv")
+    # 2. 指定された CSV の読み込み
+    csv_path = os.path.join(DRIVE_DIR, csv_filename)
     if not os.path.exists(csv_path):
         # ローカルデバッグ用
         local_csv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_drive", "学習.csv")
@@ -193,7 +194,7 @@ def download_missing_prices(ticker, interval, existing_ticker_df):
         df = df.reset_index()
         df.columns = [str(c).lower() for c in df.columns]
         df = df.rename(columns={"datetime": "date"})
-        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_convert("Asia/Tokyo").dt.tz_localize(None)
         df["ticker"] = str(ticker)
         
         cols = ["date", "ticker", "open", "high", "low", "close", "volume"]
@@ -247,7 +248,7 @@ def parse_yfinance_batch(df_raw, chunk_tickers):
             t_df = t_df.reset_index()
             t_df.columns = [str(c).lower() for c in t_df.columns]
             t_df = t_df.rename(columns={"datetime": "date", "index": "date"}) # yfinanceの戻り値によりインデックス名が異なる
-            t_df["date"] = pd.to_datetime(t_df["date"]).dt.tz_localize(None) # タイムゾーンを統一
+            t_df["date"] = pd.to_datetime(t_df["date"]).dt.tz_convert("Asia/Tokyo").dt.tz_localize(None) # 日本時間に変換してから時差を消す
             t_df["ticker"] = str(ticker)
             
             # 必要なカラムに絞る
@@ -263,9 +264,9 @@ def parse_yfinance_batch(df_raw, chunk_tickers):
 
 # --- データベース統合更新 ---
 
-def update_price_database():
+def update_price_database(csv_filename="学習.csv"):
     """全時間軸、全指定銘柄のDBを一括（バッチ）で更新する"""
-    tickers = update_universe()
+    tickers = update_universe(csv_filename)
     
     if not tickers:
         print("No tickers found. Skipping update.")
@@ -331,6 +332,10 @@ def update_price_database():
                 chunk_df = parse_yfinance_batch(raw_data, chunk)
                 if not chunk_df.empty:
                     all_new_data.append(chunk_df)
+                
+                # レートリミット対策：バッチごとに少し待機
+                print(f"  Waiting 2 seconds to avoid rate limiting...")
+                time.sleep(2)
                     
             except Exception as e:
                 print(f"  Error in batch download: {e}")
@@ -349,14 +354,20 @@ def update_price_database():
             print(f"No new data fetched for {interval}.")
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Stock Data Pipeline")
+    parser.add_argument("--csv", type=str, default="学習.csv", help="Target CSV filename in DRIVE_DIR")
+    args = parser.parse_args()
+
     start_time = datetime.now()
     print(f"Pipeline started at {start_time}")
     
     import sys
     print(f"Current Working Directory: {os.getcwd()}")
     print(f"Script Location: {os.path.abspath(__file__)}")
+    print(f"Using CSV: {args.csv}")
     
-    update_price_database()
+    update_price_database(args.csv)
     
     end_time = datetime.now()
     print(f"\nPipeline finished. Duration: {end_time - start_time}")
