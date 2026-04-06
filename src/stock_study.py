@@ -247,6 +247,7 @@ def parse_yfinance_batch(df_raw, chunk_tickers):
             t_df = t_df.reset_index()
             t_df.columns = [str(c).lower() for c in t_df.columns]
             t_df = t_df.rename(columns={"datetime": "date", "index": "date"}) # yfinanceの戻り値によりインデックス名が異なる
+            t_df["date"] = pd.to_datetime(t_df["date"]).dt.tz_localize(None) # タイムゾーンを統一
             t_df["ticker"] = str(ticker)
             
             # 必要なカラムに絞る
