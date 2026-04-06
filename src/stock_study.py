@@ -290,17 +290,22 @@ def update_price_database(csv_filename="学習.csv"):
             # ※本当は銘柄ごとに期間を変えたいが、yf.download(list)の制約上、一括して過去から取る
             # 学習モードの場合は period="max" または十分な過去から取る
             
-            # 各銘柄の最終更新日のうち、最も古いものを基準にする（穴を作らないため）
-            # ただし1分足などは期間制限(7日)があるため調整が必要
-            start_date = "2023-01-01" # デフォルト開始日
+            # バッチ内の銘柄ごとに「手元の最新日」を確認し、最も古いものに合わせる
+            start_date = "2023-01-01"  # デフォルト開始日
             
-            # 手元にデータがある場合は、その最新日の翌日から
             if not db_df.empty:
-                last_update = db_df["date"].max()
-                if pd.notnull(last_update):
-                    start_date = (last_update + timedelta(days=1)).strftime("%Y-%m-%d")
-                    
-            # 1分足制限
+                # このバッチに含まれる銘柄のデータのみ抽出
+                chunk_existing_df = db_df[db_df["ticker"].isin(chunk)]
+                
+                # 全ての銘柄がすでにDBに存在するかチェック
+                tickers_in_chunk_db = chunk_existing_df["ticker"].unique()
+                if len(tickers_in_chunk_db) == len(chunk):
+                    # 全員揃っているなら、その中で最も古い更新日の翌日から開始
+                    last_updates_per_ticker = chunk_existing_df.groupby("ticker")["date"].max()
+                    oldest_last_update = last_updates_per_ticker.min()
+                    start_date = (oldest_last_update + timedelta(days=1)).strftime("%Y-%m-%d")
+            
+            # 1分足制限 (7日)
             if interval == "1m":
                 limit = datetime.now() - timedelta(days=6)
                 if pd.to_datetime(start_date) < limit:
