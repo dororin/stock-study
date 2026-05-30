@@ -146,30 +146,12 @@ def update_universe(csv_filename="学習.csv"):
 
 # --- 株価取得・加工 ---
 
-def attach_finalized_flag(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """確定フラグを付与: 本日以前→True（確定）、本日→False（未確定）"""
-    now = datetime.now()
-    if df.empty:
-        return df
-    if interval == "1d":
-        today_date = now.date()
-        df["is_finalized"] = df["date"].dt.date < today_date
-    else:
-        df["is_finalized"] = df["date"] < (now - timedelta(hours=1))
-    return df
-
 def merge_price_data(old_df, new_df):
-    """確定フラグ方式によるマージ: start_date以降の旧データを新データで上書き"""
+    """結合・重複削除・ソート"""
     if new_df is None or new_df.empty:
         return old_df
-    if old_df.empty:
-        return new_df
-
-    # 新データの最小日付以降を旧DBから除去（未確定データの上書き）
-    new_min_date = new_df["date"].min()
-    old_part = old_df[old_df["date"] < new_min_date].copy()
-
-    combined = pd.concat([old_part, new_df], ignore_index=True)
+        
+    combined = pd.concat([old_df, new_df])
     combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
     combined = combined.sort_values(["ticker", "date"])
     return combined
@@ -269,7 +251,6 @@ def update_price_database(csv_filename="学習.csv"):
                             df_raw = yf.download([f"{t}.T" for t in chunk], start=start_date_str, interval=interval, auto_adjust=False, actions=True, progress=False, threads=True, timeout=30)
                             chunk_processed = parse_yfinance_batch(df_raw, chunk)
                             if not chunk_processed.empty:
-                                chunk_processed = attach_finalized_flag(chunk_processed, interval)
                                 all_downloaded.append(chunk_processed)
                             break
                         except Exception as e:
@@ -315,7 +296,6 @@ def update_price_database(csv_filename="学習.csv"):
                         df_raw = yf.download([f"{t}.T" for t in chunk], start=start_date_b_dt.strftime("%Y-%m-%d"), interval=interval, auto_adjust=False, actions=True, progress=False, threads=True, timeout=30)
                         chunk_processed = parse_yfinance_batch(df_raw, chunk)
                         if not chunk_processed.empty:
-                            chunk_processed = attach_finalized_flag(chunk_processed, interval)
                             all_downloaded.append(chunk_processed)
                         break
                     except Exception as e:
